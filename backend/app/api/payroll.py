@@ -1,0 +1,225 @@
+"""
+Payroll processing API endpoints
+"""
+import logging
+import zipfile
+from collections import defaultdict
+from io import BytesIO
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import date
+
+from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import Response
+from sqlmodel import select
+from sqlalchemy.orm import selectinload
+
+from ..models import Timesheet, Job
+from ..schemas.payroll import (
+    PayrollProcessRequest,
+    PayrollEntryDetail,
+    PayrollWorkerSummary,
+)
+from ..services.payroll_pdf import generate_payroll_pdf
+# Rates and _round_hours are re-exported so that anything importing them from this
+# module keeps working now that the cost math lives in services/job_cost.py.
+from ..services.job_cost import (  # noqa: F401
+    KM_RATE_OWN_VEHICLE,
+    HST_RATE,
+    MINIMUM_HOURS,
+    _round_hours,
+    compute_timesheet_cost,
+    compute_worker_hst,
+    compute_worker_payout,
+)
+from .deps import DBSession, ManagerUser
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _build_payroll_summaries(
+    session: object,
+    start_date: date,
+    end_date: date,
+    worker_ids: list[int] | None = None,
+) -> tuple[list[PayrollWorkerSummary], list[Timesheet]]:
+    """
+    Build payroll summaries for workers with unpaid timesheets in date range.
+    If worker_ids is provided, only include those workers.
+    Returns (worker_summaries, timesheets).
+    """
+    statement = (
+        select(Timesheet)
+        .where(
+            Timesheet.date >= start_date,
+            Timesheet.date <= end_date,
+            Timesheet.is_paid == False,
+        )
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+        )
+        .order_by(Timesheet.date)
+    )
+    if worker_ids:
+        statement = statement.where(Timesheet.worker_id.in_(worker_ids))
+    timesheets = session.exec(statement).all()
+
+    if not timesheets:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No unpaid timesheets found in the selected date range",
+        )
+
+    # Group by worker
+    grouped: dict[int, list[Timesheet]] = defaultdict(list)
+    for ts in timesheets:
+        grouped[ts.worker_id].append(ts)
+
+    worker_summaries: list[PayrollWorkerSummary] = []
+
+    for worker_id, worker_timesheets in grouped.items():
+        entries: list[PayrollEntryDetail] = []
+        # Identity comes from the resolved cost lines, not worker_timesheets[0].worker:
+        # migration 0018 orphans timesheets, so a single unpaid entry from a deleted
+        # worker used to AttributeError the entire payroll run.
+        worker_name = "Unknown worker"
+        charges_hst = False
+
+        total_hours = Decimal("0")
+        total_labour = Decimal("0")
+        total_km = Decimal("0")
+        total_km_cost = Decimal("0")
+        total_personal_materials = Decimal("0")
+
+        for ts in worker_timesheets:
+            cost = compute_timesheet_cost(ts)
+            worker_name = cost.worker_name
+            charges_hst = cost.charges_hst
+            client_name = ts.job.client.name if ts.job and ts.job.client else "Unknown"
+
+            entry = PayrollEntryDetail(
+                timesheet_id=cost.timesheet_id,
+                date=cost.date,
+                customer_name=client_name,
+                job_description=ts.job.title if ts.job else "",
+                hours_worked=cost.hours_worked,
+                break_duration=cost.break_duration,
+                billable_hours=cost.billable_hours,
+                labour_rate=cost.hourly_rate,
+                labour_cost=cost.labour_cost,
+                km_distance=cost.km_distance,
+                km_rate=cost.km_rate,
+                km_cost=cost.km_cost,
+                personal_materials=cost.personal_materials,
+                minimum_hours_override=cost.minimum_hours_override,
+            )
+            entries.append(entry)
+
+            total_hours += cost.billable_hours
+            total_labour += cost.labour_cost
+            total_km += cost.km_distance
+            total_km_cost += cost.km_cost
+            total_personal_materials += cost.personal_materials
+
+        # Shared with the worker-facing preview so shown pay equals paid pay by
+        # construction. company_materials is excluded: the company already paid for it.
+        payout = compute_worker_payout(
+            total_labour, total_km_cost, total_personal_materials, charges_hst
+        )
+
+        summary = PayrollWorkerSummary(
+            worker_id=worker_id,
+            worker_name=worker_name,
+            entries=entries,
+            total_hours=total_hours,
+            total_labour=total_labour,
+            total_km=total_km,
+            total_km_cost=total_km_cost,
+            total_personal_materials=total_personal_materials,
+            labour_hst=payout.labour_hst,
+            km_hst=payout.km_hst,
+            materials_hst=payout.materials_hst,
+            grand_total=payout.grand_total,
+            charges_hst=charges_hst,
+        )
+        worker_summaries.append(summary)
+
+    return worker_summaries, timesheets
+
+
+@router.post("/preview-period", response_model=list[PayrollWorkerSummary])
+def preview_payroll_period(
+    data: PayrollProcessRequest,
+    session: DBSession,
+    current_user: ManagerUser,
+):
+    """
+    Preview payroll for a date range without processing.
+    Returns worker summaries for review before committing.
+    """
+    if data.end_date < data.start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="End date must be after start date",
+        )
+
+    summaries, _ = _build_payroll_summaries(session, data.start_date, data.end_date, data.worker_ids)
+    return summaries
+
+
+@router.post("/process-period")
+def process_payroll_period(
+    data: PayrollProcessRequest,
+    session: DBSession,
+    current_user: ManagerUser,
+):
+    """
+    Process payroll for a date range.
+    Generates per-worker PDF summaries, archives timesheets, returns ZIP.
+    """
+    if data.end_date < data.start_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="End date must be after start date",
+        )
+
+    summaries, timesheets = _build_payroll_summaries(session, data.start_date, data.end_date, data.worker_ids)
+
+    # Generate PDFs
+    worker_pdfs: list[tuple[str, bytes]] = []
+    for summary in summaries:
+        pdf_bytes = generate_payroll_pdf(summary, data.start_date, data.end_date)
+        safe_name = summary.worker_name.replace(" ", "_").replace("/", "_")
+        filename = f"Payroll_{safe_name}_{data.start_date}_{data.end_date}.pdf"
+        worker_pdfs.append((filename, pdf_bytes))
+
+    # All PDFs generated successfully — now mark timesheets as paid (atomic)
+    for ts in timesheets:
+        ts.is_paid = True
+        session.add(ts)
+    session.commit()
+
+    logger.info(
+        f"Payroll processed: {len(summaries)} workers, "
+        f"{len(timesheets)} timesheets archived "
+        f"({data.start_date} to {data.end_date})"
+    )
+
+    # Create ZIP in memory
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, pdf_bytes in worker_pdfs:
+            zf.writestr(filename, pdf_bytes)
+    zip_buffer.seek(0)
+
+    # Return ZIP response
+    zip_filename = f"Payroll_{data.start_date}_{data.end_date}.zip"
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+        },
+    )

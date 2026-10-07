@@ -1,0 +1,726 @@
+"""
+Timesheet API endpoints
+"""
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
+from sqlmodel import select
+from sqlalchemy.orm import selectinload
+from datetime import datetime
+from decimal import Decimal
+import uuid
+import logging
+
+logger = logging.getLogger(__name__)
+
+from ..config import settings
+from ..models import Timesheet, Worker, Job, Receipt, TimesheetInventoryItem
+from ..schemas.timesheet import (
+    TimesheetCreate,
+    TimesheetUpdate,
+    TimesheetResponse,
+    ReceiptResponse,
+    PayoutPreview,
+    InventoryItemCreate,
+    InventoryItemResponse,
+)
+from ..schemas.worker import WorkerBrief
+from ..schemas.job import JobBrief
+from ..services.job_cost import (
+    compute_entry_payout,
+    compute_timesheet_cost,
+    rounded_hours_before_minimum,
+)
+from ..services.s3 import upload_file_to_s3, delete_file_from_s3
+from .deps import DBSession, CurrentUser, CurrentWorker, ManagerUser
+
+router = APIRouter()
+
+
+def timesheet_to_response(timesheet: Timesheet) -> TimesheetResponse:
+    """Convert Timesheet model to response schema"""
+    return TimesheetResponse(
+        id=timesheet.id,
+        date=timesheet.date,
+        hours_worked=timesheet.hours_worked,
+        break_duration=timesheet.break_duration,
+        used_company_truck=timesheet.used_company_truck,
+        worked_at_hq=timesheet.worked_at_hq,
+        is_redseal=timesheet.is_redseal,
+        company_materials=timesheet.company_materials,
+        personal_materials=timesheet.personal_materials,
+        calculated_pay=compute_entry_payout(compute_timesheet_cost(timesheet)).grand_total,
+        minimum_hours_override=timesheet.minimum_hours_override,
+        notes=timesheet.notes,
+        is_paid=timesheet.is_paid,
+        receipt_count=len(timesheet.receipts) if timesheet.receipts else 0,
+        created_at=timesheet.created_at,
+        worker=WorkerBrief(id=timesheet.worker.id, name=timesheet.worker.name)
+        if timesheet.worker
+        else WorkerBrief(id=0, name=timesheet.worker_name_snapshot or "Former Employee"),
+        job=JobBrief(
+            id=timesheet.job.id,
+            title=timesheet.job.title,
+            client_name=timesheet.job.client.name if timesheet.job.client else "",
+            start_date=timesheet.job.start_date,
+            end_date=timesheet.job.end_date,
+        ),
+    )
+
+
+@router.get("/", response_model=list[TimesheetResponse])
+def list_timesheets(
+    session: DBSession,
+    current_user: CurrentUser,
+    worker_id: int | None = None,
+):
+    """
+    List timesheets.
+    - Workers: see only their own timesheets
+    - Managers: see all timesheets (or filter by worker_id)
+    """
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.is_paid == False)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+            selectinload(Timesheet.receipts),
+        )
+    )
+
+    if current_user.is_manager:
+        if worker_id:
+            statement = statement.where(Timesheet.worker_id == worker_id)
+    else:
+        # Workers only see their own
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if worker:
+            statement = statement.where(Timesheet.worker_id == worker.id)
+        else:
+            return []
+
+    statement = statement.order_by(Timesheet.date.desc())
+    timesheets = session.exec(statement).all()
+
+    return [timesheet_to_response(ts) for ts in timesheets]
+
+
+@router.get("/paid", response_model=list[TimesheetResponse])
+def list_paid_timesheets(
+    session: DBSession,
+    current_user: ManagerUser,
+):
+    """
+    List all paid timesheets. Manager only.
+    Used on the paid timesheets review page.
+    """
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.is_paid == True)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+            selectinload(Timesheet.receipts),
+        )
+        .order_by(Timesheet.date.desc())
+    )
+    timesheets = session.exec(statement).all()
+    return [timesheet_to_response(ts) for ts in timesheets]
+
+
+@router.get("/by-job/{job_id}", response_model=list[TimesheetResponse])
+def list_timesheets_by_job(
+    job_id: int,
+    session: DBSession,
+    current_user: ManagerUser,
+):
+    """
+    List ALL timesheets for a job (including paid ones). Manager only.
+    Used on the completed jobs page to review historical timesheets.
+    """
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.job_id == job_id)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+            selectinload(Timesheet.receipts),
+        )
+        .order_by(Timesheet.date.desc())
+    )
+    timesheets = session.exec(statement).all()
+    return [timesheet_to_response(ts) for ts in timesheets]
+
+
+@router.post("/{timesheet_id}/mark-unpaid", response_model=TimesheetResponse)
+def mark_timesheet_unpaid(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: ManagerUser,
+):
+    """Mark a paid timesheet as unpaid so it can be re-processed in payroll."""
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.id == timesheet_id)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+            selectinload(Timesheet.receipts),
+        )
+    )
+    timesheet = session.exec(statement).first()
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    if timesheet.worker_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reprocess a timesheet for a deleted employee.",
+        )
+
+    timesheet.is_paid = False
+    session.add(timesheet)
+    session.commit()
+    session.refresh(timesheet)
+
+    return timesheet_to_response(timesheet)
+
+
+@router.post("/", response_model=TimesheetResponse, status_code=status.HTTP_201_CREATED)
+def create_timesheet(
+    data: TimesheetCreate,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Submit a new timesheet"""
+    # Get worker profile
+    worker = session.exec(
+        select(Worker).where(Worker.user_id == current_user.id)
+    ).first()
+
+    if not worker:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Worker profile not found",
+        )
+
+    # Verify job exists and worker is assigned
+    job = session.exec(
+        select(Job)
+        .where(Job.id == data.job_id)
+        .options(selectinload(Job.assigned_workers), selectinload(Job.client))
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+
+    # Check if worker is assigned (managers can submit for any job)
+    if not current_user.is_manager:
+        is_assigned = any(w.id == worker.id for w in job.assigned_workers)
+        if not is_assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not assigned to this job",
+            )
+
+    # Create timesheet
+    timesheet = Timesheet(
+        worker_id=worker.id,
+        job_id=data.job_id,
+        date=data.date,
+        hours_worked=data.hours_worked,
+        break_duration=data.break_duration,
+        used_company_truck=data.used_company_truck,
+        worked_at_hq=data.worked_at_hq,
+        is_redseal=data.is_redseal,
+        company_materials=data.company_materials,
+        personal_materials=data.personal_materials,
+        notes=data.notes,
+    )
+
+    # Calculate pay
+
+    session.add(timesheet)
+    session.commit()
+    session.refresh(timesheet)
+
+    # Reload with relationships
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.id == timesheet.id)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+        )
+    )
+    timesheet = session.exec(statement).first()
+
+    return timesheet_to_response(timesheet)
+
+
+@router.get("/{timesheet_id}", response_model=TimesheetResponse)
+def get_timesheet(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Get a specific timesheet"""
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.id == timesheet_id)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+            selectinload(Timesheet.receipts),
+        )
+    )
+    timesheet = session.exec(statement).first()
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    # Authorization: own timesheet or manager
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    return timesheet_to_response(timesheet)
+
+
+@router.put("/{timesheet_id}", response_model=TimesheetResponse)
+def update_timesheet(
+    timesheet_id: int,
+    data: TimesheetUpdate,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Update a timesheet"""
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.id == timesheet_id)
+        .options(selectinload(Timesheet.worker))
+    )
+    timesheet = session.exec(statement).first()
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    update_data = data.model_dump(exclude_unset=True)
+
+    # A paid timesheet is locked so a payout can never be changed after the fact.
+    # is_redseal is the one exception: it only affects what the CLIENT is billed and
+    # cannot move a payout, and without this a forgotten tick is uncorrectable.
+    if timesheet.is_paid:
+        redseal_only = set(update_data) <= {"is_redseal"}
+        if not (redseal_only and current_user.is_manager):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot edit a paid timesheet",
+            )
+
+    # Authorization: own timesheet or manager
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    # Update fields
+    for key, value in update_data.items():
+        setattr(timesheet, key, value)
+
+    timesheet.updated_at = datetime.utcnow()
+
+    # Recalculate pay
+
+    session.add(timesheet)
+    session.commit()
+
+    # Reload with relationships
+    statement = (
+        select(Timesheet)
+        .where(Timesheet.id == timesheet_id)
+        .options(
+            selectinload(Timesheet.worker),
+            selectinload(Timesheet.job).selectinload(Job.client),
+        )
+    )
+    timesheet = session.exec(statement).first()
+
+    return timesheet_to_response(timesheet)
+
+
+@router.delete("/{timesheet_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_timesheet(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Delete a timesheet"""
+    timesheet = session.get(Timesheet, timesheet_id)
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    # Authorization: own timesheet or manager
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    receipts = session.exec(
+        select(Receipt).where(Receipt.timesheet_id == timesheet_id)
+    ).all()
+
+    for receipt in receipts:
+        if receipt.public_url:
+            try:
+                delete_file_from_s3(receipt.public_url)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to delete S3 object for receipt %s: %s",
+                    receipt.id,
+                    exc,
+                )
+        session.delete(receipt)
+
+    session.flush()
+    session.delete(timesheet)
+    session.commit()
+
+
+@router.post("/{timesheet_id}/receipts")
+def upload_receipts(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+    files: list[UploadFile] = File(...),
+    description: str | None = Form(default=None),
+    amount: str | None = Form(default=None),            # before tax
+    amount_after_tax: str | None = Form(default=None),
+):
+    """Upload receipt images for a timesheet — stores in AWS S3"""
+    timesheet = session.get(Timesheet, timesheet_id)
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    if timesheet.is_paid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot add receipts to a paid timesheet",
+        )
+
+    # Authorization
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    amount_decimal = Decimal(amount) if amount else None
+    amount_after_tax_decimal = Decimal(amount_after_tax) if amount_after_tax else None
+
+    uploaded = []
+    logger.info(f"Receipt upload: timesheet_id={timesheet_id}, file_count={len(files)}")
+
+    for file in files:
+        content = file.file.read()
+        content_type = file.content_type or "image/jpeg"
+        filename = file.filename or f"{uuid.uuid4()}.jpg"
+
+        logger.info(f"Processing file: {filename}, type={content_type}, size={len(content)} bytes")
+
+        public_url = upload_file_to_s3(content, filename, content_type)
+
+        receipt = Receipt(
+            timesheet_id=timesheet_id,
+            public_url=public_url,
+            content_type=content_type,
+            description=description or None,
+            amount=amount_decimal,
+            amount_after_tax=amount_after_tax_decimal,
+        )
+        session.add(receipt)
+        uploaded.append({"filename": filename, "url": public_url})
+
+    session.commit()
+    logger.info(f"Receipt upload complete: {len(uploaded)} files saved")
+
+    return {"uploaded": len(uploaded), "files": uploaded}
+
+
+@router.get("/{timesheet_id}/receipts", response_model=list[ReceiptResponse])
+def get_timesheet_receipts(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Get all receipts for a timesheet"""
+    timesheet = session.get(Timesheet, timesheet_id)
+
+    if not timesheet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Timesheet not found",
+        )
+
+    # Authorization
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    statement = select(Receipt).where(Receipt.timesheet_id == timesheet_id)
+    receipts = session.exec(statement).all()
+
+    return [
+        ReceiptResponse(
+            id=r.id,
+            timesheet_id=r.timesheet_id,
+            image_url=r.public_url,
+            description=r.description,
+            amount=r.amount,
+            amount_after_tax=r.amount_after_tax,
+            uploaded_at=r.uploaded_at,
+        )
+        for r in receipts
+    ]
+
+
+@router.delete("/receipts/{receipt_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_receipt(
+    receipt_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Delete a receipt — removes from S3 and database"""
+    receipt = session.get(Receipt, receipt_id)
+
+    if not receipt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Receipt not found",
+        )
+
+    # Get timesheet for authorization
+    timesheet = session.get(Timesheet, receipt.timesheet_id)
+
+    if not current_user.is_manager:
+        worker = session.exec(
+            select(Worker).where(Worker.user_id == current_user.id)
+        ).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied",
+            )
+
+    # Delete from S3
+    if receipt.public_url:
+        try:
+            delete_file_from_s3(receipt.public_url)
+        except Exception:
+            pass  # Don't fail the delete if S3 cleanup fails
+
+    session.delete(receipt)
+    session.commit()
+
+
+@router.get("/{timesheet_id}/inventory-items", response_model=list[InventoryItemResponse])
+def get_inventory_items(
+    timesheet_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """List inventory items for a timesheet"""
+    timesheet = session.get(Timesheet, timesheet_id)
+    if not timesheet:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timesheet not found")
+
+    if not current_user.is_manager:
+        worker = session.exec(select(Worker).where(Worker.user_id == current_user.id)).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    items = session.exec(
+        select(TimesheetInventoryItem).where(TimesheetInventoryItem.timesheet_id == timesheet_id)
+    ).all()
+    return items
+
+
+@router.post("/{timesheet_id}/inventory-items", response_model=InventoryItemResponse, status_code=status.HTTP_201_CREATED)
+def add_inventory_item(
+    timesheet_id: int,
+    data: InventoryItemCreate,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Add an inventory item to a timesheet"""
+    timesheet = session.get(Timesheet, timesheet_id)
+    if not timesheet:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Timesheet not found")
+
+    if timesheet.is_paid:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit a paid timesheet")
+
+    if not current_user.is_manager:
+        worker = session.exec(select(Worker).where(Worker.user_id == current_user.id)).first()
+        if not worker or timesheet.worker_id != worker.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    item = TimesheetInventoryItem(
+        timesheet_id=timesheet_id,
+        description=data.description,
+        quantity=data.quantity,
+    )
+    session.add(item)
+    session.commit()
+    session.refresh(item)
+    return item
+
+
+@router.delete("/inventory-items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_inventory_item(
+    item_id: int,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Delete a timesheet inventory item"""
+    item = session.get(TimesheetInventoryItem, item_id)
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    timesheet = session.get(Timesheet, item.timesheet_id)
+    if timesheet and timesheet.is_paid:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit a paid timesheet")
+
+    if not current_user.is_manager:
+        worker = session.exec(select(Worker).where(Worker.user_id == current_user.id)).first()
+        if not worker or (timesheet and timesheet.worker_id != worker.id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    session.delete(item)
+    session.commit()
+
+
+def _build_payout_preview(timesheet: Timesheet, worker: Worker, job: Job | None) -> PayoutPreview:
+    """
+    What this entry will pay, from the same engine the payroll run uses.
+
+    worker and job are passed explicitly rather than assigned onto the timesheet:
+    Job.timesheets cascades all, delete-orphan, so assigning a persistent Job to a
+    transient row would push it into that collection and a later flush would insert a
+    timesheet nobody submitted.
+    """
+    cost = compute_timesheet_cost(timesheet, worker=worker, job=job)
+    payout = compute_entry_payout(cost)
+    rounded = rounded_hours_before_minimum(cost.hours_worked, cost.break_duration)
+
+    return PayoutPreview(
+        hours_worked=cost.hours_worked,
+        break_duration=cost.break_duration,
+        rounded_hours=rounded,
+        billable_hours=cost.billable_hours,
+        minimum_applied=cost.billable_hours > rounded,
+        hourly_rate=cost.hourly_rate,
+        labour_cost=cost.labour_cost,
+        km_distance=cost.km_distance,
+        km_rate=cost.km_rate,
+        km_cost=cost.km_cost,
+        used_company_truck=cost.used_company_truck,
+        worked_at_hq=cost.worked_at_hq,
+        personal_materials=cost.personal_materials,
+        company_materials=cost.company_materials,
+        hst_applied=cost.charges_hst,
+        labour_hst=payout.labour_hst,
+        km_hst=payout.km_hst,
+        materials_hst=payout.materials_hst,
+        calculated_pay=payout.grand_total,
+    )
+
+
+@router.post("/calculate", response_model=PayoutPreview)
+def calculate_payout_preview(
+    data: TimesheetCreate,
+    session: DBSession,
+    current_user: CurrentUser,
+):
+    """Preview payout calculation without creating a timesheet"""
+    # Get worker profile
+    worker = session.exec(
+        select(Worker).where(Worker.user_id == current_user.id)
+    ).first()
+
+    if not worker:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Worker profile not found",
+        )
+
+    job = session.get(Job, data.job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+
+    # Transient: deliberately never given .job or .worker, see _build_payout_preview.
+    temp_timesheet = Timesheet(
+        worker_id=worker.id,
+        job_id=data.job_id,
+        date=data.date,
+        hours_worked=data.hours_worked,
+        break_duration=data.break_duration,
+        used_company_truck=data.used_company_truck,
+        worked_at_hq=data.worked_at_hq,
+        is_redseal=data.is_redseal,
+        company_materials=data.company_materials,
+        personal_materials=data.personal_materials,
+    )
+
+    return _build_payout_preview(temp_timesheet, worker, job)
